@@ -26,4 +26,6 @@ app 包骨架（Info.plist、图标）在仓库内，构建后把二进制复制
 
 ## 数据来源
 
-全部来自 `IORegistryEntryCreateCFProperties(AppleSmartBattery)`：`PowerTelemetryData`（SystemPowerIn/SystemLoad）、`AdapterDetails`（含 UsbHvcMenu PD 档位）、电池电压/电流/温度/循环次数等。
+- **实时功率**：SMC 浮点键 `PDTR`（DC 输入）/ `PSTR`（系统总功耗），亚秒级刷新；电池充放 = 输入 − 负载 恒等推导
+- **慢数据**：`IORegistryEntryCreateCFProperties(AppleSmartBattery)` —— 电量、健康度/循环次数、`AdapterDetails`（含 UsbHvcMenu PD 档位）、NotChargingReason 等原因码
+- **事件**：`IOPSNotificationCreateRunLoopSource` 订阅插拔/电量变化，事件到达立即刷新
