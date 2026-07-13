@@ -1,4 +1,5 @@
 import IOKit
+import IOKit.ps
 import SwiftUI
 import UserNotifications
 
@@ -79,6 +80,7 @@ final class PowerStore: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        registerPowerSourceNotification()
         Task {
             await fetchOnce()
             await MainActor.run {
@@ -91,9 +93,39 @@ final class PowerStore: ObservableObject {
         }
     }
 
+    // 订阅系统电源事件（插拔/电量变化），事件到达立即刷新，不用等下一个轮询周期
+    private var powerSourceRunLoopSource: CFRunLoopSource?
+
+    private func registerPowerSourceNotification() {
+        let callback: IOPowerSourceCallbackType = { context in
+            guard let context else { return }
+            let store = Unmanaged<PowerStore>.fromOpaque(context).takeUnretainedValue()
+            Task { @MainActor in
+                await store.fetchOnce()
+            }
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
+            powerSourceRunLoopSource = source
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+    }
+
+    // 上一采样出现过的橙色警告 kind；警告需连续两个采样命中才展示（去抖插拔瞬间的过渡样本）
+    private var pendingWarningKinds: Set<String> = []
+
+    private func debounced(_ info: PowerInfo) -> PowerInfo {
+        let currentKinds = Set(info.diagnostics.filter { $0.color == .orange }.map { $0.kind })
+        var result = info
+        result.diagnostics = info.diagnostics.filter { $0.color != .orange || pendingWarningKinds.contains($0.kind) }
+        result.status = result.diagnostics.contains { $0.color == .orange } ? .warn : .ok
+        pendingWarningKinds = currentKinds
+        return result
+    }
+
     private func fetchOnce() async {
         do {
-            let info = try await PowerMonitor.fetch()
+            let info = debounced(try await PowerMonitor.fetch())
             checkTransitions(old: powerInfo, new: info)
             self.powerInfo = info
             self.isLoading = false
@@ -453,19 +485,17 @@ struct PowerMeterView: View {
 
             HStack(spacing: 10) {
                 PowerBreakdownItem(
+                    label: "电源输入",
+                    value: String(format: "%.1f W", info.systemPowerInWatts)
+                )
+                PowerBreakdownItem(
                     label: "系统负载",
                     value: info.systemLoadWatts != nil
                         ? String(format: "%.1f W", info.systemLoadWatts!)
                         : "-- W"
                 )
                 PowerBreakdownItem(
-                    label: "电池入电",
-                    value: info.batteryPowerWatts != nil
-                        ? String(format: "%.1f W", info.batteryPowerWatts!)
-                        : "-- W"
-                )
-                PowerBreakdownItem(
-                    label: "电池实测",
+                    label: "电池充放",
                     value: info.batteryRealWatts != nil
                         ? String(format: "%+.1f W", info.batteryRealWatts!)
                         : "-- W"
@@ -505,82 +535,119 @@ struct RealtimeMiniChartView: View {
 
     var body: some View {
         Canvas { context, size in
-            let top: CGFloat = 20
-            let bottom = size.height - 28
+            let leftGutter: CGFloat = 42
+            let rightGutter: CGFloat = 46
+            let top: CGFloat = 16
+            let bottom = size.height - 24
+            let plotLeft = leftGutter
+            let plotRight = size.width - rightGutter
+            let plotWidth = plotRight - plotLeft
+
             let inputs = history.map { $0.watts }
             let batts = history.map { $0.batteryWatts }
-            let maxV = max(inputs.max() ?? 1, batts.max() ?? 0, 1)
-            let minV = min(inputs.min() ?? 0, batts.min() ?? 0, 0)
 
-            func yFor(_ value: Double) -> CGFloat {
-                bottom - CGFloat((value - minV) / (maxV - minV)) * (bottom - top)
+            // 步长取整到 1/2/5 × 10^n
+            func niceStep(_ raw: Double) -> Double {
+                let magnitude = pow(10, floor(log10(max(raw, 0.001))))
+                let normalized = raw / magnitude
+                return (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) * magnitude
+            }
+
+            // 左轴（蓝，电源输入）：0 ~ inTop，4 格
+            let inStep = niceStep(max(inputs.max() ?? 1, 1) / 4)
+            let inTop = inStep * 4
+
+            // 右轴（绿，电池充放）：零点居中，±battHalf，上下各 2 格
+            let battStep = niceStep(max(batts.map { abs($0) }.max() ?? 1, 1) / 2)
+            let battHalf = battStep * 2
+
+            func yForInput(_ value: Double) -> CGFloat {
+                bottom - CGFloat(value / inTop) * (bottom - top)
+            }
+            func yForBatt(_ value: Double) -> CGFloat {
+                let mid = (top + bottom) / 2
+                return mid - CGFloat(value / battHalf) * (bottom - top) / 2
             }
             func xFor(_ index: Int) -> CGFloat {
-                history.count > 1 ? size.width / CGFloat(history.count - 1) * CGFloat(index) : 0
+                plotLeft + (history.count > 1 ? plotWidth / CGFloat(history.count - 1) * CGFloat(index) : 0)
             }
-            let zeroY = yFor(0)
 
-            // Grid lines
-            for i in 1..<4 {
+            // 网格线（共 5 行）+ 双侧刻度：左侧输入值，右侧电池值
+            let axisFont = Font.system(size: 10, weight: .medium)
+            func format(_ value: Double, step: Double, signed: Bool) -> String {
+                let text = step < 1 ? String(format: "%.1f", value) : "\(Int(value))"
+                return (signed && value > 0 ? "+" : "") + text + "W"
+            }
+            for i in 0...4 {
                 let y = top + (bottom - top) / 4 * CGFloat(i)
-                var path = Path()
-                path.move(to: CGPoint(x: 0, y: y))
-                path.addLine(to: CGPoint(x: size.width, y: y))
-                context.stroke(path, with: .color(Color.secondary.opacity(0.1)), lineWidth: 1)
+                var line = Path()
+                line.move(to: CGPoint(x: plotLeft, y: y))
+                line.addLine(to: CGPoint(x: plotRight, y: y))
+                if i == 2 {
+                    // 中线 = 电池零点
+                    context.stroke(line, with: .color(Color.green.opacity(0.35)), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                } else {
+                    context.stroke(line, with: .color(Color.secondary.opacity(0.12)), lineWidth: 1)
+                }
+                let inputValue = inTop * Double(4 - i) / 4
+                context.draw(Text(format(inputValue, step: inStep, signed: false)).font(axisFont).foregroundColor(Color.accentColor.opacity(0.75)),
+                             at: CGPoint(x: plotLeft - 6, y: y), anchor: .trailing)
+                let battValue = battHalf * Double(2 - i) / 2
+                context.draw(Text(format(battValue, step: battStep, signed: true)).font(axisFont).foregroundColor(Color.green.opacity(0.85)),
+                             at: CGPoint(x: plotRight + 6, y: y), anchor: .leading)
             }
 
-            // Zero line
-            var zeroPath = Path()
-            zeroPath.move(to: CGPoint(x: 0, y: zeroY))
-            zeroPath.addLine(to: CGPoint(x: size.width, y: zeroY))
-            context.stroke(zeroPath, with: .color(Color.secondary.opacity(0.2)), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            func seriesPoints(_ values: [Double], yFor: (Double) -> CGFloat) -> [CGPoint] {
+                values.enumerated().map { CGPoint(x: xFor($0.offset), y: yFor($0.element)) }
+            }
 
-            func seriesPath(_ values: [Double]) -> Path {
+            // Catmull-Rom 样条平滑，替代生硬的折线
+            func smoothPath(_ points: [CGPoint]) -> Path {
                 var path = Path()
-                for (index, value) in values.enumerated() {
-                    let point = CGPoint(x: xFor(index), y: yFor(value))
-                    if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+                guard let first = points.first else { return path }
+                path.move(to: first)
+                guard points.count > 1 else { return path }
+                for i in 1..<points.count {
+                    let p0 = points[max(i - 2, 0)]
+                    let p1 = points[i - 1]
+                    let p2 = points[i]
+                    let p3 = points[min(i + 1, points.count - 1)]
+                    let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+                    let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+                    path.addCurve(to: p2, control1: c1, control2: c2)
                 }
                 return path
             }
 
-            // 电源输入：面积 + 主线
-            var areaPath = seriesPath(inputs)
-            areaPath.addLine(to: CGPoint(x: size.width, y: zeroY))
-            areaPath.addLine(to: CGPoint(x: 0, y: zeroY))
+            let softStroke = StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
+
+            // 电源输入：面积（到左轴零点=底部）+ 主线
+            let inputPoints = seriesPoints(inputs, yFor: yForInput)
+            var areaPath = smoothPath(inputPoints)
+            areaPath.addLine(to: CGPoint(x: plotRight, y: bottom))
+            areaPath.addLine(to: CGPoint(x: plotLeft, y: bottom))
             areaPath.closeSubpath()
             context.fill(areaPath, with: .color(Color.accentColor.opacity(0.08)))
-            let inputLine = seriesPath(inputs)
-            context.stroke(inputLine, with: .color(Color.accentColor.opacity(0.3)), lineWidth: 5)
-            context.stroke(inputLine, with: .color(Color.accentColor), lineWidth: 2)
+            let inputLine = smoothPath(inputPoints)
+            context.stroke(inputLine, with: .color(Color.accentColor.opacity(0.3)), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
+            context.stroke(inputLine, with: .color(Color.accentColor), style: softStroke)
 
-            // 电池充放电：细线（正=充电，负=放电）
-            context.stroke(seriesPath(batts), with: .color(Color.green), lineWidth: 1.5)
+            // 电池充放电：中线上方=充电，下方=放电
+            context.stroke(smoothPath(seriesPoints(batts, yFor: yForBatt)), with: .color(Color.green), style: softStroke)
 
-            // 纵轴标签
-            let axisFont = Font.system(size: 11, weight: .medium)
-            context.draw(Text("\(Int(maxV))W").font(axisFont).foregroundColor(.secondary),
-                         at: CGPoint(x: 4, y: top - 8), anchor: .leading)
-            context.draw(Text("0W").font(axisFont).foregroundColor(.secondary),
-                         at: CGPoint(x: 4, y: zeroY - 8), anchor: .leading)
-            if minV < -0.5 {
-                context.draw(Text("\(Int(minV))W").font(axisFont).foregroundColor(.secondary),
-                             at: CGPoint(x: 4, y: bottom + 2), anchor: .topLeading)
-            }
-
-            // 时间标签（anchor 避免截断）
+            // 时间标签
             if let first = history.first, let last = history.last {
                 let fmt = Date.FormatStyle(date: .omitted, time: .shortened)
                 let timeFont = Font.system(size: 10, weight: .medium)
                 context.draw(Text(first.timestamp, format: fmt).font(timeFont).foregroundColor(.secondary),
-                             at: CGPoint(x: 4, y: size.height - 2), anchor: .bottomLeading)
+                             at: CGPoint(x: plotLeft, y: size.height - 2), anchor: .bottomLeading)
                 context.draw(Text(last.timestamp, format: fmt).font(timeFont).foregroundColor(.secondary),
-                             at: CGPoint(x: size.width - 4, y: size.height - 2), anchor: .bottomTrailing)
+                             at: CGPoint(x: plotRight, y: size.height - 2), anchor: .bottomTrailing)
             }
 
             // 悬停查看
-            if let hx = hoverX, history.count > 1 {
-                let index = min(max(Int(round(hx / size.width * CGFloat(history.count - 1))), 0), history.count - 1)
+            if let hx = hoverX, history.count > 1, hx >= plotLeft, hx <= plotRight {
+                let index = min(max(Int(round((hx - plotLeft) / plotWidth * CGFloat(history.count - 1))), 0), history.count - 1)
                 let point = history[index]
                 let px = xFor(index)
 
@@ -589,8 +656,12 @@ struct RealtimeMiniChartView: View {
                 cursor.addLine(to: CGPoint(x: px, y: bottom))
                 context.stroke(cursor, with: .color(Color.secondary.opacity(0.4)), lineWidth: 1)
 
-                for (value, color) in [(point.watts, Color.accentColor), (point.batteryWatts, Color.green)] {
-                    let marker = CGRect(x: px - 3.5, y: yFor(value) - 3.5, width: 7, height: 7)
+                let markers: [(CGFloat, Color)] = [
+                    (yForInput(point.watts), Color.accentColor),
+                    (yForBatt(point.batteryWatts), Color.green)
+                ]
+                for (my, color) in markers {
+                    let marker = CGRect(x: px - 3.5, y: my - 3.5, width: 7, height: 7)
                     context.fill(Path(ellipseIn: marker), with: .color(color))
                 }
 
@@ -875,14 +946,14 @@ struct PowerProfile: Identifiable, Hashable {
 }
 
 struct DiagnosticMessage: Hashable {
+    let kind: String   // 稳定标识，用于跨采样去抖（text 含动态数字，不能作 key）
     let text: String
     let color: Color
 }
 
 struct PowerInfo: Sendable {
     let systemPowerInWatts: Double      // 总输入功率 = SystemPowerIn
-    let systemLoadWatts: Double?        // 系统负载 = SystemLoad
-    let batteryPowerWatts: Double?      // 电池入电结余 = SystemPowerIn - SystemLoad
+    let systemLoadWatts: Double?        // 系统负载 = 输入 - 电池实测（遥测 SystemLoad 滞后不可靠）
     let batteryRealWatts: Double?       // 电池端实测功率 = 电压 × 电流（负值 = 放电）
     let adapterLimitWatts: Int?         // 适配器上限 = Watts
     let adapterProtocol: String?
@@ -897,9 +968,80 @@ struct PowerInfo: Sendable {
     let cycleCount: Int?                // 电池循环次数
     let healthPercent: Int?             // 健康度 = NominalChargeCapacity / DesignCapacity
     let activePDIndex: Int?             // 当前协商的 PD 档位 index
-    let status: PowerStatus
+    var status: PowerStatus             // 由可见诊断推导；去抖过滤后由 PowerStore 重算
     let profiles: [PowerProfile]
-    let diagnostics: [DiagnosticMessage]
+    var diagnostics: [DiagnosticMessage]
+}
+
+// MARK: - SMC 实时功率
+
+/// 读取 SMC 浮点功率键。PDTR（DC 输入）/PSTR（系统总功耗）亚秒级刷新，
+/// 弥补注册表遥测和电池电量计几十秒才更新一次的滞后。
+final class SMCPowerReader: @unchecked Sendable {
+    static let shared = SMCPowerReader()
+
+    private let connection: io_connect_t
+
+    private struct SMCVersion { var major: UInt8 = 0; var minor: UInt8 = 0; var build: UInt8 = 0; var reserved: UInt8 = 0; var release: UInt16 = 0 }
+    private struct SMCPLimitData { var version: UInt16 = 0; var length: UInt16 = 0; var cpuPLimit: UInt32 = 0; var gpuPLimit: UInt32 = 0; var memPLimit: UInt32 = 0 }
+    private struct SMCKeyInfoData { var dataSize: UInt32 = 0; var dataType: UInt32 = 0; var dataAttributes: UInt8 = 0 }
+    private struct SMCParamStruct {
+        var key: UInt32 = 0
+        var vers = SMCVersion()
+        var pLimitData = SMCPLimitData()
+        var keyInfo = SMCKeyInfoData()
+        var padding: UInt16 = 0
+        var result: UInt8 = 0
+        var status: UInt8 = 0
+        var data8: UInt8 = 0
+        var data32: UInt32 = 0
+        var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    }
+
+    private init() {
+        var conn: io_connect_t = 0
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        if service != 0 {
+            IOServiceOpen(service, mach_task_self_, 0, &conn)
+            IOObjectRelease(service)
+        }
+        connection = conn
+    }
+
+    private func fourCC(_ s: String) -> UInt32 {
+        s.utf8.reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    private func call(_ input: inout SMCParamStruct) -> SMCParamStruct? {
+        var output = SMCParamStruct()
+        var outSize = MemoryLayout<SMCParamStruct>.stride
+        let result = IOConnectCallStructMethod(connection, 2, &input, MemoryLayout<SMCParamStruct>.stride, &output, &outSize)
+        guard result == kIOReturnSuccess, output.result == 0 else { return nil }
+        return output
+    }
+
+    /// 读取 flt 类型键，返回瓦特；键不存在或类型不符返回 nil
+    func readWatts(_ key: String) -> Double? {
+        guard connection != 0 else { return nil }
+        var input = SMCParamStruct()
+        input.key = fourCC(key)
+        input.data8 = 9 // kSMCGetKeyInfo
+        guard let info = call(&input),
+              info.keyInfo.dataSize == 4,
+              info.keyInfo.dataType == fourCC("flt ") else { return nil }
+        input.keyInfo = info.keyInfo
+        input.data8 = 5 // kSMCReadKey
+        guard let out = call(&input) else { return nil }
+        let b = out.bytes
+        let raw = UInt32(b.0) | (UInt32(b.1) << 8) | (UInt32(b.2) << 16) | (UInt32(b.3) << 24)
+        let value = Double(Float(bitPattern: raw))
+        return value.isFinite ? value : nil
+    }
 }
 
 // MARK: - Power Monitor
@@ -907,7 +1049,9 @@ struct PowerInfo: Sendable {
 enum PowerMonitor {
     static func fetch() async throws -> PowerInfo {
         let props = try batteryProperties()
-        return parse(props)
+        let smcDcIn = SMCPowerReader.shared.readWatts("PDTR")
+        let smcSystem = SMCPowerReader.shared.readWatts("PSTR")
+        return parse(props, smcDcIn: smcDcIn, smcSystem: smcSystem)
     }
 
     // 直接读 IOKit 注册表，替代旧的 pmset/ioreg 子进程 + 正则解析
@@ -945,7 +1089,7 @@ enum PowerMonitor {
         findValue(key, in: container) as? Int
     }
 
-    private static func parse(_ props: [String: Any]) -> PowerInfo {
+    private static func parse(_ props: [String: Any], smcDcIn: Double?, smcSystem: Double?) -> PowerInfo {
         // 电量百分比（Apple Silicon 上 CurrentCapacity 即 0-100，兜底按 MaxCapacity 换算）
         var percent = props["CurrentCapacity"] as? Int
         if let cur = percent, let maxCap = props["MaxCapacity"] as? Int, maxCap > 0, maxCap != 100 {
@@ -969,7 +1113,8 @@ enum PowerMonitor {
 
         let telemetry = props["PowerTelemetryData"] as? [String: Any] ?? [:]
         var adapter = props["AdapterDetails"] as? [String: Any] ?? [:]
-        if adapter["Watts"] == nil,
+        // 回退只在确实接电时生效：AppleRawAdapterDetails 拔电后可能残留上一个充电器的记录
+        if onAC, adapter["Watts"] == nil,
            let rawAdapters = props["AppleRawAdapterDetails"] as? [[String: Any]],
            let first = rawAdapters.first(where: { $0["Watts"] != nil }) {
             adapter = first
@@ -978,9 +1123,10 @@ enum PowerMonitor {
         let systemPowerInMw = telemetry["SystemPowerIn"] as? Int
         let systemLoadMw = telemetry["SystemLoad"] as? Int
 
-        let adapterWatts = adapter["Watts"] as? Int
-        let adapterVoltage = adapter["AdapterVoltage"] as? Int
-        let adapterCurrent = adapter["Current"] as? Int
+        // 拔电后适配器信息一律视为无效，防止残留值"复活"已拔掉的充电器
+        let adapterWatts = onAC ? adapter["Watts"] as? Int : nil
+        let adapterVoltage = onAC ? adapter["AdapterVoltage"] as? Int : nil
+        let adapterCurrent = onAC ? adapter["Current"] as? Int : nil
 
         let voltage = (props["Voltage"] as? Int).map { Double($0) / 1000 }
         let amperage = props["Amperage"] as? Int
@@ -1004,80 +1150,64 @@ enum PowerMonitor {
             healthPercent = nil
         }
 
-        // 电池端实测功率 = 电压 × 电流（负值 = 放电）
-        let batteryRealWatts: Double?
+        // 电量计功率 = 电压 × 电流（负值 = 放电）。注意电量计几十秒才刷新，只作回退
+        let gaugeWatts: Double?
         if let v = voltage, let a = amperage {
-            batteryRealWatts = v * Double(a) / 1000
+            gaugeWatts = v * Double(a) / 1000
         } else {
+            gaugeWatts = nil
+        }
+
+        // 实时功率优先走 SMC：输入 = PDTR，负载 = PSTR，电池 = 输入 - 负载。
+        // 三者恒等自洽且亚秒级刷新；SMC 不可用时回退到注册表遥测/电量计。
+        // 拔电后输入定义上就是 0，按 ExternalConnected 钳制。
+        let systemPowerInWatts = onAC ? (smcDcIn ?? systemPowerInMw.map { Double($0) / 1000 } ?? 0) : 0
+        let systemLoadWatts: Double?
+        let batteryRealWatts: Double?
+        if let sys = smcSystem {
+            systemLoadWatts = sys
+            batteryRealWatts = systemPowerInWatts - sys
+        } else if let gauge = gaugeWatts {
+            systemLoadWatts = systemPowerInWatts - gauge
+            batteryRealWatts = gauge
+        } else {
+            systemLoadWatts = systemLoadMw.map { Double($0) / 1000 }
             batteryRealWatts = nil
         }
 
-        // Convert to watts
-        // 总输入 = SystemPowerIn
-        // 系统负载 = SystemLoad（电脑实际耗电）
-        // 电池入电/结余 = SystemPowerIn - SystemLoad（剩余给电池的）
-        let systemPowerInWatts = systemPowerInMw.map { Double($0) / 1000 } ?? 0
-        let systemLoadWatts = systemLoadMw.map { Double($0) / 1000 }
-        let batteryPowerWatts: Double?
-        if let sysIn = systemPowerInMw, let sysLoad = systemLoadMw {
-            batteryPowerWatts = Double(sysIn - sysLoad) / 1000
-        } else {
-            batteryPowerWatts = nil
-        }
-
-        // 用电池供电是正常状态，不算异常；异常只针对接电后的问题
         let hasAdapter = adapterWatts != nil
-        var powerStatus: PowerStatus = .ok
-        if hasAdapter {
-            if let battPower = batteryPowerWatts, battPower < -5 {
-                // Battery discharging significantly while on AC - check if adapter is undersized
-                powerStatus = .warn
-            } else if isCharging == true && systemPowerInWatts > 0 && systemPowerInWatts < 5 {
-                // 只有充电中输入还偏低才算异常；满电挂机低输入是正常的
-                powerStatus = .warn
-            } else if isCharging == false && (percent ?? 100) < 100 {
-                // 接着电源但没在充电，也没充满
-                powerStatus = .warn
-            }
-        } else if onAC {
-            // 接了 AC 但读不到适配器信息
-            powerStatus = .warn
-        }
 
-        // Build diagnostics
+        // Build diagnostics（kind 是稳定标识，供跨采样去抖；状态胶囊由可见诊断推导）
         var diagnostics: [DiagnosticMessage] = []
 
         if systemPowerInWatts > 0 {
             diagnostics.append(DiagnosticMessage(
+                kind: "input-ok",
                 text: "当前电脑从电源拿到约 \(String(format: "%.1f", systemPowerInWatts))W",
                 color: .green
             ))
         }
 
-        if let battPower = batteryPowerWatts {
-            if battPower > 0 {
+        if onAC, let real = batteryRealWatts {
+            if real > 0.5 {
                 diagnostics.append(DiagnosticMessage(
-                    text: "电池正在充电，入电约 \(String(format: "%.1f", battPower))W。",
+                    kind: "charging",
+                    text: "电池正在充电，入电约 \(String(format: "%.1f", real))W。",
                     color: .green
                 ))
-            } else if battPower < -2 {
+            } else if real < -2 {
                 diagnostics.append(DiagnosticMessage(
-                    text: "电脑高负载运行中，电源供给不足，电池正在辅助放电 \(String(format: "%.1f", abs(battPower)))W。",
+                    kind: "battery-assist",
+                    text: "电脑高负载运行中，电源供给不足，电池正在辅助放电 \(String(format: "%.1f", abs(real)))W。",
                     color: .orange
                 ))
             } else {
                 diagnostics.append(DiagnosticMessage(
+                    kind: "maintain",
                     text: "电源已接入，电池电量维持中。",
                     color: .green
                 ))
             }
-        }
-
-        if isCharging == true && systemPowerInWatts > 0 && systemPowerInWatts < 5 {
-            diagnostics.append(DiagnosticMessage(
-                text: "充电中但电源输入偏低，可能是适配器功率不足或 PD 协商异常。",
-                color: .orange
-            ))
         }
 
         // 接电但未充电（排除已充满的情况）
@@ -1086,12 +1216,14 @@ enum PowerMonitor {
             if let reason = notChargingReason, reason != 0 {
                 text += "（NotChargingReason=\(reason)）"
             }
-            diagnostics.append(DiagnosticMessage(text: text, color: .orange))
+            diagnostics.append(DiagnosticMessage(kind: "not-charging", text: text, color: .orange))
         }
 
-        // 充电中但电池实际入电很低
-        if hasAdapter, isCharging == true, let real = batteryRealWatts, real > 0, real < 8 {
+        // 充电中但电池实际入电很低（临近充满的涓流阶段除外）
+        if hasAdapter, isCharging == true, (percent ?? 100) < 95,
+           let real = batteryRealWatts, real > 0, real < 8 {
             diagnostics.append(DiagnosticMessage(
+                kind: "low-intake",
                 text: "适配器已识别，但电池实际入电仅 \(String(format: "%.1f", real))W，可能是 PD 协商、线材、接口或充电控制状态异常。",
                 color: .orange
             ))
@@ -1099,6 +1231,7 @@ enum PowerMonitor {
 
         if let slow = slowChargingReason, slow != 0 {
             diagnostics.append(DiagnosticMessage(
+                kind: "slow-charging",
                 text: "充电正被系统限速（SlowChargingReason=\(slow)）。",
                 color: .orange
             ))
@@ -1106,6 +1239,7 @@ enum PowerMonitor {
 
         if let inhibit = chargerInhibitReason, inhibit != 0 {
             diagnostics.append(DiagnosticMessage(
+                kind: "charger-inhibit",
                 text: "充电器处于抑制状态（ChargerInhibitReason=\(inhibit)）。",
                 color: .orange
             ))
@@ -1113,6 +1247,7 @@ enum PowerMonitor {
 
         if let thermal = thermallyLimited, thermal > 0 {
             diagnostics.append(DiagnosticMessage(
+                kind: "thermal",
                 text: "电池曾出现温度限制充电记录。",
                 color: .orange
             ))
@@ -1120,16 +1255,19 @@ enum PowerMonitor {
 
         if let adapterW = adapterWatts {
             diagnostics.append(DiagnosticMessage(
+                kind: "pd-ok",
                 text: "适配器已协商 USB-C PD：上限 \(adapterW)W。",
                 color: .green
             ))
         } else if onAC {
             diagnostics.append(DiagnosticMessage(
+                kind: "no-pd",
                 text: "已接入 AC 但未读取到有效 PD 档位；优先检查线材、接口或重新插拔触发协商。",
                 color: .orange
             ))
         } else if let real = batteryRealWatts, real < 0 {
             diagnostics.append(DiagnosticMessage(
+                kind: "on-battery",
                 text: "电池供电中，放电功率约 \(String(format: "%.1f", abs(real)))W。",
                 color: .green
             ))
@@ -1140,10 +1278,14 @@ enum PowerMonitor {
         let dailyMaxSoc = findInt("DailyMaxSoc", in: props)
         if let minSoc = dailyMinSoc, let maxSoc = dailyMaxSoc {
             diagnostics.append(DiagnosticMessage(
+                kind: "soc-range",
                 text: "今日电量区间：最低 \(minSoc)%，最高 \(maxSoc)%。",
                 color: .green
             ))
         }
+
+        // 状态胶囊由诊断推导：有任一橙色警告即"注意"，单一事实源
+        let powerStatus: PowerStatus = diagnostics.contains { $0.color == .orange } ? .warn : .ok
 
         // PD 档位
         var profiles: [PowerProfile] = []
@@ -1179,7 +1321,6 @@ enum PowerMonitor {
         return PowerInfo(
             systemPowerInWatts: systemPowerInWatts,
             systemLoadWatts: systemLoadWatts,
-            batteryPowerWatts: batteryPowerWatts,
             batteryRealWatts: batteryRealWatts,
             adapterLimitWatts: adapterWatts,
             adapterProtocol: adapterProtocol,
