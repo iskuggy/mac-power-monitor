@@ -1,7 +1,7 @@
-import IOKit
-import IOKit.ps
+import AppKit
 import SwiftUI
-import UserNotifications
+
+// MARK: - App 入口
 
 @main
 struct MacPowerMonitorApp: App {
@@ -49,144 +49,7 @@ struct TrayMenuView: View {
     }
 }
 
-@MainActor
-final class PowerStore: ObservableObject {
-    @Published var powerInfo: PowerInfo?
-    @Published var isLoading = true
-    @Published var history: [PowerHistoryPoint] = []
-    @Published var errorMessage: String?
-
-    private var timer: Timer?
-    private var started = false
-    private let updateInterval: TimeInterval = 2.0
-    private let maxHistoryDuration: TimeInterval = 7200 // 保留 2 小时
-
-    init() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        start()
-    }
-
-    var menuBarLabel: String {
-        guard let info = powerInfo else { return "--" }
-        if info.systemPowerInWatts > 0.5 {
-            return String(format: "%.0fW", info.systemPowerInWatts)
-        }
-        if let percent = info.batteryPercent {
-            return "\(percent)%"
-        }
-        return "--"
-    }
-
-    func start() {
-        guard !started else { return }
-        started = true
-        registerPowerSourceNotification()
-        Task {
-            await fetchOnce()
-            await MainActor.run {
-                self.timer = Timer.scheduledTimer(withTimeInterval: self.updateInterval, repeats: true) { _ in
-                    Task { @MainActor in
-                        await self.fetchOnce()
-                    }
-                }
-            }
-        }
-    }
-
-    // 订阅系统电源事件（插拔/电量变化），事件到达立即刷新，不用等下一个轮询周期
-    private var powerSourceRunLoopSource: CFRunLoopSource?
-
-    private func registerPowerSourceNotification() {
-        let callback: IOPowerSourceCallbackType = { context in
-            guard let context else { return }
-            let store = Unmanaged<PowerStore>.fromOpaque(context).takeUnretainedValue()
-            Task { @MainActor in
-                await store.fetchOnce()
-            }
-        }
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
-            powerSourceRunLoopSource = source
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-        }
-    }
-
-    // 上一采样出现过的橙色警告 kind；警告需连续两个采样命中才展示（去抖插拔瞬间的过渡样本）
-    private var pendingWarningKinds: Set<String> = []
-
-    private func debounced(_ info: PowerInfo) -> PowerInfo {
-        let currentKinds = Set(info.diagnostics.filter { $0.color == .orange }.map { $0.kind })
-        var result = info
-        result.diagnostics = info.diagnostics.filter { $0.color != .orange || pendingWarningKinds.contains($0.kind) }
-        result.status = result.diagnostics.contains { $0.color == .orange } ? .warn : .ok
-        pendingWarningKinds = currentKinds
-        return result
-    }
-
-    private func fetchOnce() async {
-        do {
-            let info = debounced(try await PowerMonitor.fetch())
-            checkTransitions(old: powerInfo, new: info)
-            self.powerInfo = info
-            self.isLoading = false
-            self.errorMessage = nil
-
-            let point = PowerHistoryPoint(
-                timestamp: Date(),
-                watts: info.systemPowerInWatts,
-                batteryWatts: info.batteryRealWatts ?? 0
-            )
-            self.history.append(point)
-            let cutoff = Date().addingTimeInterval(-maxHistoryDuration)
-            if let firstValid = self.history.firstIndex(where: { $0.timestamp >= cutoff }), firstValid > 0 {
-                self.history.removeFirst(firstValid)
-            }
-
-        } catch {
-            self.errorMessage = error.localizedDescription
-            self.isLoading = false
-        }
-    }
-
-    // MARK: 状态跃迁通知
-
-    private func checkTransitions(old: PowerInfo?, new: PowerInfo) {
-        guard let old = old else { return }
-
-        // 开始充电
-        if old.isCharging != true && new.isCharging == true {
-            notify(title: "开始充电",
-                   body: "适配器\(new.adapterLimitWatts.map { " \($0)W" } ?? "")，当前电量 \(new.batteryPercent ?? 0)%")
-        }
-
-        // 充满
-        if (old.batteryPercent ?? 0) < 100, (new.batteryPercent ?? 0) >= 100, new.adapterLimitWatts != nil {
-            notify(title: "电池已充满", body: "可以拔掉电源了")
-        }
-
-        // 低电量（放电中跨过 20%）
-        if (old.batteryPercent ?? 100) > 20, let p = new.batteryPercent, p <= 20, new.adapterLimitWatts == nil {
-            notify(title: "电量偏低", body: "剩余 \(p)%，建议接入电源")
-        }
-
-        // 接电但未充电（状态新出现时提醒一次）
-        func notChargingWhilePlugged(_ info: PowerInfo) -> Bool {
-            info.adapterLimitWatts != nil && info.isCharging == false && (info.batteryPercent ?? 100) < 100
-        }
-        if notChargingWhilePlugged(new) && !notChargingWhilePlugged(old) {
-            notify(title: "接电但未充电", body: "检查优化充电 / AlDente，或重新插拔电源线")
-        }
-    }
-
-    private func notify(title: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
-    }
-}
+// MARK: - 主界面
 
 struct ContentView: View {
     @ObservedObject var store: PowerStore
@@ -208,6 +71,9 @@ struct ContentView: View {
                     ProgressView("正在读取电源数据...")
                         .frame(maxWidth: .infinity, minHeight: 400)
                 } else if let info = store.powerInfo {
+                    if store.errorMessage != nil {
+                        StaleDataBanner(sampledAt: info.sampledAt)
+                    }
                     HeroSection(info: info, history: store.history)
                     MetricsGridView(info: info)
                     BottomPanels(info: info)
@@ -240,11 +106,23 @@ struct ContentView: View {
     }
 }
 
-struct PowerHistoryPoint: Identifiable {
-    let id = UUID()
-    let timestamp: Date
-    let watts: Double        // 电源输入
-    let batteryWatts: Double // 电池实测（负 = 放电）
+/// 数据读取失败但仍有旧数据可显示时的提示条
+struct StaleDataBanner: View {
+    let sampledAt: Date
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("电源数据读取失败，以下显示的是 \(sampledAt.formatted(date: .omitted, time: .standard)) 的数据")
+                .font(.caption)
+                .fontWeight(.medium)
+            Spacer()
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
 }
 
 // MARK: - Hero Section
@@ -477,7 +355,7 @@ struct PowerMeterView: View {
                     .font(.subheadline)
                     .fontWeight(.semibold)
 
-                Text("更新时间 \(Date().formatted(date: .omitted, time: .standard))")
+                Text("更新时间 \(info.sampledAt.formatted(date: .omitted, time: .standard))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fontDesign(.monospaced)
@@ -928,416 +806,5 @@ struct DiagnosticsPanel: View {
         .padding(20)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
-    }
-}
-
-// MARK: - Data Model
-
-enum PowerStatus {
-    case ok, warn, danger
-}
-
-struct PowerProfile: Identifiable, Hashable {
-    let id = UUID()
-    let index: Int
-    let voltageV: Double
-    let currentA: Double
-    let watts: Int
-}
-
-struct DiagnosticMessage: Hashable {
-    let kind: String   // 稳定标识，用于跨采样去抖（text 含动态数字，不能作 key）
-    let text: String
-    let color: Color
-}
-
-struct PowerInfo: Sendable {
-    let systemPowerInWatts: Double      // 总输入功率 = SystemPowerIn
-    let systemLoadWatts: Double?        // 系统负载 = 输入 - 电池实测（遥测 SystemLoad 滞后不可靠）
-    let batteryRealWatts: Double?       // 电池端实测功率 = 电压 × 电流（负值 = 放电）
-    let adapterLimitWatts: Int?         // 适配器上限 = Watts
-    let adapterProtocol: String?
-    let amperage: Int?
-    let voltage: Double?
-    let batteryPercent: Int?
-    let batteryStatus: String?
-    let isCharging: Bool?
-    let timeToFull: Int?
-    let timeRemaining: Int?             // 放电剩余时间（分钟）
-    let temperature: Double?
-    let cycleCount: Int?                // 电池循环次数
-    let healthPercent: Int?             // 健康度 = NominalChargeCapacity / DesignCapacity
-    let activePDIndex: Int?             // 当前协商的 PD 档位 index
-    var status: PowerStatus             // 由可见诊断推导；去抖过滤后由 PowerStore 重算
-    let profiles: [PowerProfile]
-    var diagnostics: [DiagnosticMessage]
-}
-
-// MARK: - SMC 实时功率
-
-/// 读取 SMC 浮点功率键。PDTR（DC 输入）/PSTR（系统总功耗）亚秒级刷新，
-/// 弥补注册表遥测和电池电量计几十秒才更新一次的滞后。
-final class SMCPowerReader: @unchecked Sendable {
-    static let shared = SMCPowerReader()
-
-    private let connection: io_connect_t
-
-    private struct SMCVersion { var major: UInt8 = 0; var minor: UInt8 = 0; var build: UInt8 = 0; var reserved: UInt8 = 0; var release: UInt16 = 0 }
-    private struct SMCPLimitData { var version: UInt16 = 0; var length: UInt16 = 0; var cpuPLimit: UInt32 = 0; var gpuPLimit: UInt32 = 0; var memPLimit: UInt32 = 0 }
-    private struct SMCKeyInfoData { var dataSize: UInt32 = 0; var dataType: UInt32 = 0; var dataAttributes: UInt8 = 0 }
-    private struct SMCParamStruct {
-        var key: UInt32 = 0
-        var vers = SMCVersion()
-        var pLimitData = SMCPLimitData()
-        var keyInfo = SMCKeyInfoData()
-        var padding: UInt16 = 0
-        var result: UInt8 = 0
-        var status: UInt8 = 0
-        var data8: UInt8 = 0
-        var data32: UInt32 = 0
-        var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    }
-
-    private init() {
-        var conn: io_connect_t = 0
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
-        if service != 0 {
-            IOServiceOpen(service, mach_task_self_, 0, &conn)
-            IOObjectRelease(service)
-        }
-        connection = conn
-    }
-
-    private func fourCC(_ s: String) -> UInt32 {
-        s.utf8.reduce(0) { ($0 << 8) | UInt32($1) }
-    }
-
-    private func call(_ input: inout SMCParamStruct) -> SMCParamStruct? {
-        var output = SMCParamStruct()
-        var outSize = MemoryLayout<SMCParamStruct>.stride
-        let result = IOConnectCallStructMethod(connection, 2, &input, MemoryLayout<SMCParamStruct>.stride, &output, &outSize)
-        guard result == kIOReturnSuccess, output.result == 0 else { return nil }
-        return output
-    }
-
-    /// 读取 flt 类型键，返回瓦特；键不存在或类型不符返回 nil
-    func readWatts(_ key: String) -> Double? {
-        guard connection != 0 else { return nil }
-        var input = SMCParamStruct()
-        input.key = fourCC(key)
-        input.data8 = 9 // kSMCGetKeyInfo
-        guard let info = call(&input),
-              info.keyInfo.dataSize == 4,
-              info.keyInfo.dataType == fourCC("flt ") else { return nil }
-        input.keyInfo = info.keyInfo
-        input.data8 = 5 // kSMCReadKey
-        guard let out = call(&input) else { return nil }
-        let b = out.bytes
-        let raw = UInt32(b.0) | (UInt32(b.1) << 8) | (UInt32(b.2) << 16) | (UInt32(b.3) << 24)
-        let value = Double(Float(bitPattern: raw))
-        return value.isFinite ? value : nil
-    }
-}
-
-// MARK: - Power Monitor
-
-enum PowerMonitor {
-    static func fetch() async throws -> PowerInfo {
-        let props = try batteryProperties()
-        let smcDcIn = SMCPowerReader.shared.readWatts("PDTR")
-        let smcSystem = SMCPowerReader.shared.readWatts("PSTR")
-        return parse(props, smcDcIn: smcDcIn, smcSystem: smcSystem)
-    }
-
-    // 直接读 IOKit 注册表，替代旧的 pmset/ioreg 子进程 + 正则解析
-    private static func batteryProperties() throws -> [String: Any] {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
-        guard service != 0 else {
-            throw NSError(domain: "PowerMonitor", code: 2, userInfo: [NSLocalizedDescriptionKey: "找不到 AppleSmartBattery 服务"])
-        }
-        defer { IOObjectRelease(service) }
-
-        var propsRef: Unmanaged<CFMutableDictionary>?
-        let result = IORegistryEntryCreateCFProperties(service, &propsRef, kCFAllocatorDefault, 0)
-        guard result == KERN_SUCCESS, let props = propsRef?.takeRetainedValue() as? [String: Any] else {
-            throw NSError(domain: "PowerMonitor", code: Int(result), userInfo: [NSLocalizedDescriptionKey: "读取电池注册表属性失败"])
-        }
-        return props
-    }
-
-    // 根级优先，找不到再递归进嵌套字典/数组（对应旧版全文搜索的语义）
-    private static func findValue(_ key: String, in container: Any) -> Any? {
-        if let dict = container as? [String: Any] {
-            if let value = dict[key] { return value }
-            for value in dict.values {
-                if let found = findValue(key, in: value) { return found }
-            }
-        } else if let array = container as? [Any] {
-            for element in array {
-                if let found = findValue(key, in: element) { return found }
-            }
-        }
-        return nil
-    }
-
-    private static func findInt(_ key: String, in container: Any) -> Int? {
-        findValue(key, in: container) as? Int
-    }
-
-    private static func parse(_ props: [String: Any], smcDcIn: Double?, smcSystem: Double?) -> PowerInfo {
-        // 电量百分比（Apple Silicon 上 CurrentCapacity 即 0-100，兜底按 MaxCapacity 换算）
-        var percent = props["CurrentCapacity"] as? Int
-        if let cur = percent, let maxCap = props["MaxCapacity"] as? Int, maxCap > 0, maxCap != 100 {
-            percent = cur * 100 / maxCap
-        }
-
-        let isCharging = props["IsCharging"] as? Bool
-        let onAC = (props["ExternalConnected"] as? Bool) ?? false
-        let fullyCharged = (props["FullyCharged"] as? Bool) ?? false
-
-        let status: String
-        if !onAC {
-            status = "放电中"
-        } else if isCharging == true {
-            status = "充电中"
-        } else if fullyCharged {
-            status = "已充满"
-        } else {
-            status = "已接电，未充电"
-        }
-
-        let telemetry = props["PowerTelemetryData"] as? [String: Any] ?? [:]
-        var adapter = props["AdapterDetails"] as? [String: Any] ?? [:]
-        // 回退只在确实接电时生效：AppleRawAdapterDetails 拔电后可能残留上一个充电器的记录
-        if onAC, adapter["Watts"] == nil,
-           let rawAdapters = props["AppleRawAdapterDetails"] as? [[String: Any]],
-           let first = rawAdapters.first(where: { $0["Watts"] != nil }) {
-            adapter = first
-        }
-
-        let systemPowerInMw = telemetry["SystemPowerIn"] as? Int
-        let systemLoadMw = telemetry["SystemLoad"] as? Int
-
-        // 拔电后适配器信息一律视为无效，防止残留值"复活"已拔掉的充电器
-        let adapterWatts = onAC ? adapter["Watts"] as? Int : nil
-        let adapterVoltage = onAC ? adapter["AdapterVoltage"] as? Int : nil
-        let adapterCurrent = onAC ? adapter["Current"] as? Int : nil
-
-        let voltage = (props["Voltage"] as? Int).map { Double($0) / 1000 }
-        let amperage = props["Amperage"] as? Int
-        let temp = (props["Temperature"] as? Int).map { Double($0) / 100 }
-        let timeFull = props["AvgTimeToFull"] as? Int
-        let timeRemaining = props["TimeRemaining"] as? Int
-
-        // 充电异常排查用的原因码
-        let notChargingReason = findInt("NotChargingReason", in: props)
-        let slowChargingReason = findInt("SlowChargingReason", in: props)
-        let chargerInhibitReason = findInt("ChargerInhibitReason", in: props)
-        let thermallyLimited = findInt("TimeChargingThermallyLimited", in: props)
-
-        // 电池健康：健康度 = 当前标称容量 / 设计容量
-        let cycleCount = findInt("CycleCount", in: props)
-        let healthPercent: Int?
-        if let design = findInt("DesignCapacity", in: props), design > 0,
-           let nominal = findInt("NominalChargeCapacity", in: props) {
-            healthPercent = nominal * 100 / design
-        } else {
-            healthPercent = nil
-        }
-
-        // 电量计功率 = 电压 × 电流（负值 = 放电）。注意电量计几十秒才刷新，只作回退
-        let gaugeWatts: Double?
-        if let v = voltage, let a = amperage {
-            gaugeWatts = v * Double(a) / 1000
-        } else {
-            gaugeWatts = nil
-        }
-
-        // 实时功率优先走 SMC：输入 = PDTR，负载 = PSTR，电池 = 输入 - 负载。
-        // 三者恒等自洽且亚秒级刷新；SMC 不可用时回退到注册表遥测/电量计。
-        // 拔电后输入定义上就是 0，按 ExternalConnected 钳制。
-        let systemPowerInWatts = onAC ? (smcDcIn ?? systemPowerInMw.map { Double($0) / 1000 } ?? 0) : 0
-        let systemLoadWatts: Double?
-        let batteryRealWatts: Double?
-        if let sys = smcSystem {
-            systemLoadWatts = sys
-            batteryRealWatts = systemPowerInWatts - sys
-        } else if let gauge = gaugeWatts {
-            systemLoadWatts = systemPowerInWatts - gauge
-            batteryRealWatts = gauge
-        } else {
-            systemLoadWatts = systemLoadMw.map { Double($0) / 1000 }
-            batteryRealWatts = nil
-        }
-
-        let hasAdapter = adapterWatts != nil
-
-        // Build diagnostics（kind 是稳定标识，供跨采样去抖；状态胶囊由可见诊断推导）
-        var diagnostics: [DiagnosticMessage] = []
-
-        if systemPowerInWatts > 0 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "input-ok",
-                text: "当前电脑从电源拿到约 \(String(format: "%.1f", systemPowerInWatts))W",
-                color: .green
-            ))
-        }
-
-        if onAC, let real = batteryRealWatts {
-            if real > 0.5 {
-                diagnostics.append(DiagnosticMessage(
-                    kind: "charging",
-                    text: "电池正在充电，入电约 \(String(format: "%.1f", real))W。",
-                    color: .green
-                ))
-            } else if real < -2 {
-                diagnostics.append(DiagnosticMessage(
-                    kind: "battery-assist",
-                    text: "电脑高负载运行中，电源供给不足，电池正在辅助放电 \(String(format: "%.1f", abs(real)))W。",
-                    color: .orange
-                ))
-            } else {
-                diagnostics.append(DiagnosticMessage(
-                    kind: "maintain",
-                    text: "电源已接入，电池电量维持中。",
-                    color: .green
-                ))
-            }
-        }
-
-        // 接电但未充电（排除已充满的情况）
-        if hasAdapter, isCharging == false, (percent ?? 100) < 100 {
-            var text = "接着电源但电池未充电。检查优化充电 / AlDente 等限充工具，或重新插拔让 PD 重新协商。"
-            if let reason = notChargingReason, reason != 0 {
-                text += "（NotChargingReason=\(reason)）"
-            }
-            diagnostics.append(DiagnosticMessage(kind: "not-charging", text: text, color: .orange))
-        }
-
-        // 充电中但电池实际入电很低（临近充满的涓流阶段除外）
-        if hasAdapter, isCharging == true, (percent ?? 100) < 95,
-           let real = batteryRealWatts, real > 0, real < 8 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "low-intake",
-                text: "适配器已识别，但电池实际入电仅 \(String(format: "%.1f", real))W，可能是 PD 协商、线材、接口或充电控制状态异常。",
-                color: .orange
-            ))
-        }
-
-        if let slow = slowChargingReason, slow != 0 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "slow-charging",
-                text: "充电正被系统限速（SlowChargingReason=\(slow)）。",
-                color: .orange
-            ))
-        }
-
-        if let inhibit = chargerInhibitReason, inhibit != 0 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "charger-inhibit",
-                text: "充电器处于抑制状态（ChargerInhibitReason=\(inhibit)）。",
-                color: .orange
-            ))
-        }
-
-        if let thermal = thermallyLimited, thermal > 0 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "thermal",
-                text: "电池曾出现温度限制充电记录。",
-                color: .orange
-            ))
-        }
-
-        if let adapterW = adapterWatts {
-            diagnostics.append(DiagnosticMessage(
-                kind: "pd-ok",
-                text: "适配器已协商 USB-C PD：上限 \(adapterW)W。",
-                color: .green
-            ))
-        } else if onAC {
-            diagnostics.append(DiagnosticMessage(
-                kind: "no-pd",
-                text: "已接入 AC 但未读取到有效 PD 档位；优先检查线材、接口或重新插拔触发协商。",
-                color: .orange
-            ))
-        } else if let real = batteryRealWatts, real < 0 {
-            diagnostics.append(DiagnosticMessage(
-                kind: "on-battery",
-                text: "电池供电中，放电功率约 \(String(format: "%.1f", abs(real)))W。",
-                color: .green
-            ))
-        }
-
-        // DailyMinSoc/DailyMaxSoc 是今日电量波动记录，仅作信息展示
-        let dailyMinSoc = findInt("DailyMinSoc", in: props)
-        let dailyMaxSoc = findInt("DailyMaxSoc", in: props)
-        if let minSoc = dailyMinSoc, let maxSoc = dailyMaxSoc {
-            diagnostics.append(DiagnosticMessage(
-                kind: "soc-range",
-                text: "今日电量区间：最低 \(minSoc)%，最高 \(maxSoc)%。",
-                color: .green
-            ))
-        }
-
-        // 状态胶囊由诊断推导：有任一橙色警告即"注意"，单一事实源
-        let powerStatus: PowerStatus = diagnostics.contains { $0.color == .orange } ? .warn : .ok
-
-        // PD 档位
-        var profiles: [PowerProfile] = []
-        if let menu = findValue("UsbHvcMenu", in: props) as? [[String: Any]] {
-            for (i, item) in menu.enumerated() {
-                guard let maxVoltage = item["MaxVoltage"] as? Int,
-                      let maxCurrent = item["MaxCurrent"] as? Int else { continue }
-                profiles.append(PowerProfile(
-                    index: item["Index"] as? Int ?? i,
-                    voltageV: Double(maxVoltage) / 1000,
-                    currentA: Double(maxCurrent) / 1000,
-                    watts: (maxVoltage * maxCurrent) / 1_000_000
-                ))
-            }
-        }
-
-        // 当前协商档位：优先注册表的 UsbHvcHvcIndex，否则按协商电压就近匹配
-        var activePDIndex = findInt("UsbHvcHvcIndex", in: props)
-        if activePDIndex == nil, let av = adapterVoltage, !profiles.isEmpty {
-            let negotiatedV = Double(av) / 1000
-            activePDIndex = profiles.min(by: { abs($0.voltageV - negotiatedV) < abs($1.voltageV - negotiatedV) })?.index
-        }
-
-        let adapterProtocol: String?
-        if adapterVoltage != nil && adapterCurrent != nil {
-            adapterProtocol = "USB-C PD"
-        } else if adapterWatts != nil || onAC {
-            adapterProtocol = "AC Power"
-        } else {
-            adapterProtocol = nil
-        }
-
-        return PowerInfo(
-            systemPowerInWatts: systemPowerInWatts,
-            systemLoadWatts: systemLoadWatts,
-            batteryRealWatts: batteryRealWatts,
-            adapterLimitWatts: adapterWatts,
-            adapterProtocol: adapterProtocol,
-            amperage: amperage,
-            voltage: voltage,
-            batteryPercent: percent,
-            batteryStatus: status,
-            isCharging: isCharging,
-            timeToFull: timeFull == 65535 ? nil : timeFull,
-            timeRemaining: timeRemaining == 65535 ? nil : timeRemaining,
-            temperature: temp,
-            cycleCount: cycleCount,
-            healthPercent: healthPercent,
-            activePDIndex: activePDIndex,
-            status: powerStatus,
-            profiles: profiles,
-            diagnostics: diagnostics
-        )
     }
 }

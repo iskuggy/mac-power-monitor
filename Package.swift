@@ -8,5 +8,9 @@ let package = Package(
         .executableTarget(
             name: "MacPowerMonitor"
         ),
+        .testTarget(
+            name: "MacPowerMonitorTests",
+            dependencies: ["MacPowerMonitor"]
+        ),
     ]
 )
