@@ -31,7 +31,7 @@ struct TrayMenuView: View {
         if let info = store.powerInfo {
             Text("电源输入 \(String(format: "%.1f", info.systemPowerInWatts))W")
             if let percent = info.batteryPercent {
-                Text("电池 \(percent)%\(info.isCharging == true ? "（充电中）" : "")")
+                Text("电池 \(percent)%\(batteryStateSuffix(info))")
             }
             if let adapterW = info.adapterLimitWatts {
                 Text("适配器上限 \(adapterW)W")
@@ -46,6 +46,12 @@ struct TrayMenuView: View {
         Button("退出") {
             NSApp.terminate(nil)
         }
+    }
+
+    private func batteryStateSuffix(_ info: PowerInfo) -> String {
+        if info.isSettlingAfterPlugIn { return "（启动中）" }
+        if info.isCharging == true { return "（充电中）" }
+        return ""
     }
 }
 
@@ -195,6 +201,7 @@ struct MiniChartCard: View {
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
     }
+
 }
 
 struct LegendDot: View {
@@ -296,12 +303,12 @@ struct PowerMeterView: View {
 
     // 接电时显示电源输入，电池模式显示放电功率
     private var displayWatts: Double {
-        info.adapterLimitWatts != nil ? info.systemPowerInWatts : abs(info.batteryRealWatts ?? 0)
+        info.isExternalPowerConnected ? info.systemPowerInWatts : abs(info.batteryRealWatts ?? 0)
     }
 
     // 量程：接电按适配器上限，电池模式按 60W 典型放电上限
     private var fullScaleWatts: Double {
-        Double(info.adapterLimitWatts ?? 60)
+        info.isExternalPowerConnected ? Double(info.adapterLimitWatts ?? 60) : 60
     }
 
     private var progress: Double {
@@ -347,11 +354,7 @@ struct PowerMeterView: View {
             .frame(width: 200, height: 200)
 
             VStack(spacing: 4) {
-                Text(info.adapterLimitWatts != nil
-                     ? (info.systemPowerInWatts > 0
-                        ? "电脑从电源拿到 \(String(format: "%.1f", info.systemPowerInWatts))W"
-                        : "电源已接入，电池已充满")
-                     : "电池放电中")
+                Text(powerSummary)
                     .font(.subheadline)
                     .fontWeight(.semibold)
 
@@ -383,6 +386,16 @@ struct PowerMeterView: View {
         .padding(28)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var powerSummary: String {
+        guard info.isExternalPowerConnected else { return "电池放电中" }
+        if info.isSettlingAfterPlugIn { return "电源已接入，充电系统启动中" }
+        if info.systemPowerInWatts > 0.5 {
+            return "电脑从电源拿到 \(String(format: "%.1f", info.systemPowerInWatts))W"
+        }
+        if (info.batteryPercent ?? 0) >= 100 { return "电源已接入，电池已充满" }
+        return "电源已接入，当前未充电"
     }
 }
 
@@ -559,6 +572,7 @@ struct RealtimeMiniChartView: View {
             }
         }
     }
+
 }
 
 // MARK: - Metrics Grid
@@ -611,8 +625,9 @@ struct MetricsGridView: View {
     }
 
     private var timeCardValue: String {
+        if info.isSettlingAfterPlugIn { return "启动中" }
         if info.isCharging == true { return formatTime(info.timeToFull) }
-        if info.adapterLimitWatts != nil && (info.batteryPercent ?? 0) >= 100 { return "已充满" }
+        if info.isExternalPowerConnected && (info.batteryPercent ?? 0) >= 100 { return "已充满" }
         return formatTime(info.timeRemaining)
     }
 

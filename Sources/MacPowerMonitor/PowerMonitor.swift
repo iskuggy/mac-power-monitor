@@ -133,11 +133,19 @@ enum PowerMonitor {
         }
 
         let isCharging = props["IsCharging"] as? Bool
-        let onAC = (props["ExternalConnected"] as? Bool) ?? false
+        let batteryReportsAC = (props["ExternalConnected"] as? Bool) ?? false
+        let negotiatedPortPowerMw = (props["PortControllerInfo"] as? [[String: Any]] ?? [])
+            .compactMap { $0["PortControllerMaxPower"] as? Int }
+            .max() ?? 0
+        let portReportsPD = negotiatedPortPowerMw > 0
+        let powerPathStuck = portReportsPD && !batteryReportsAC
+        let onAC = batteryReportsAC || portReportsPD
         let fullyCharged = (props["FullyCharged"] as? Bool) ?? false
 
         let status: String
-        if !onAC {
+        if powerPathStuck {
+            status = "电源路径异常"
+        } else if !onAC {
             status = "放电中"
         } else if isCharging == true {
             status = "充电中"
@@ -218,6 +226,15 @@ enum PowerMonitor {
         // Build diagnostics（kind 是稳定标识，供跨采样去抖；状态胶囊由可见诊断推导）
         var diagnostics: [DiagnosticMessage] = []
 
+        if powerPathStuck {
+            let negotiatedWatts = negotiatedPortPowerMw / 1000
+            diagnostics.append(DiagnosticMessage(
+                kind: "power-path-stuck",
+                text: "USB-C 端口已协商 \(negotiatedWatts)W，但电池控制器未接通电源。请换另一个 USB-C 接口；若反复出现，请重启 Mac 并检查该接口。",
+                severity: .warning
+            ))
+        }
+
         if systemPowerInWatts > 0 {
             diagnostics.append(DiagnosticMessage(
                 kind: "input-ok",
@@ -226,7 +243,7 @@ enum PowerMonitor {
             ))
         }
 
-        if onAC, let real = batteryRealWatts {
+        if onAC, !powerPathStuck, let real = batteryRealWatts {
             if real > 0.5 {
                 diagnostics.append(DiagnosticMessage(
                     kind: "charging",
@@ -249,7 +266,7 @@ enum PowerMonitor {
         }
 
         // 接电但未充电（排除已充满的情况）
-        if hasAdapter, isCharging == false, (percent ?? 100) < 100 {
+        if hasAdapter, !powerPathStuck, isCharging == false, (percent ?? 100) < 100 {
             var text = "接着电源但电池未充电。检查优化充电 / AlDente 等限充工具，或重新插拔让 PD 重新协商。"
             if let reason = notChargingReason, reason != 0 {
                 text += "（NotChargingReason=\(reason)）"
@@ -358,6 +375,7 @@ enum PowerMonitor {
 
         return PowerInfo(
             sampledAt: Date(),
+            isExternalPowerConnected: onAC,
             systemPowerInWatts: systemPowerInWatts,
             systemLoadWatts: systemLoadWatts,
             batteryRealWatts: batteryRealWatts,
@@ -374,6 +392,7 @@ enum PowerMonitor {
             cycleCount: cycleCount,
             healthPercent: healthPercent,
             activePDIndex: activePDIndex,
+            isSettlingAfterPlugIn: false,
             status: powerStatus,
             profiles: profiles,
             diagnostics: diagnostics

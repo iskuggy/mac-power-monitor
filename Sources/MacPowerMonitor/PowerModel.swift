@@ -30,6 +30,7 @@ struct DiagnosticMessage: Hashable {
 
 struct PowerInfo: Sendable {
     let sampledAt: Date                 // 本次采样时间（读取失败时 UI 据此提示数据陈旧）
+    let isExternalPowerConnected: Bool  // 物理电源连接状态，不能用适配器详情是否存在来替代
     let systemPowerInWatts: Double      // 总输入功率 = SystemPowerIn
     let systemLoadWatts: Double?        // 系统负载 = 输入 - 电池实测（遥测 SystemLoad 滞后不可靠）
     let batteryRealWatts: Double?       // 电池端实测功率 = 电压 × 电流（负值 = 放电）
@@ -38,7 +39,7 @@ struct PowerInfo: Sendable {
     let amperage: Int?
     let voltage: Double?
     let batteryPercent: Int?
-    let batteryStatus: String?
+    var batteryStatus: String?
     let isCharging: Bool?
     let timeToFull: Int?
     let timeRemaining: Int?             // 放电剩余时间（分钟）
@@ -46,6 +47,7 @@ struct PowerInfo: Sendable {
     let cycleCount: Int?                // 电池循环次数
     let healthPercent: Int?             // 健康度 = NominalChargeCapacity / DesignCapacity
     let activePDIndex: Int?             // 当前协商的 PD 档位 index
+    var isSettlingAfterPlugIn: Bool     // 插电后充电控制器尚在切换状态
     var status: PowerStatus             // 由可见诊断推导；去抖过滤后由 PowerStore 重算
     let profiles: [PowerProfile]
     var diagnostics: [DiagnosticMessage]

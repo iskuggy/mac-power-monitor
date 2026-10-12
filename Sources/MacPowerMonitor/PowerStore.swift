@@ -20,6 +20,66 @@ struct WarningDebouncer {
     }
 }
 
+/// 插电后的电源路径和电池控制器需要短暂切换。稳定期内保留事实数据，
+/// 但不把瞬时的 0W、电池辅助放电或未充电状态误报为故障。
+struct PlugInTransitionFilter {
+    let gracePeriod: TimeInterval
+
+    private var wasOnExternalPower: Bool?
+    private var pluggedInAt: Date?
+
+    init(gracePeriod: TimeInterval = 45) {
+        self.gracePeriod = gracePeriod
+    }
+
+    mutating func filter(_ info: PowerInfo, at now: Date) -> PowerInfo {
+        let onExternalPower = info.isExternalPowerConnected
+        defer { wasOnExternalPower = onExternalPower }
+
+        guard onExternalPower else {
+            pluggedInAt = nil
+            return info
+        }
+
+        if wasOnExternalPower == false {
+            pluggedInAt = now
+        }
+
+        // 一旦系统已开始正常取电并给电池充电，就提前结束稳定期。
+        if info.isCharging == true, info.systemPowerInWatts > 0.5 {
+            pluggedInAt = nil
+            return info
+        }
+
+        guard let pluggedInAt,
+              now.timeIntervalSince(pluggedInAt) < gracePeriod else {
+            self.pluggedInAt = nil
+            return info
+        }
+
+        var result = info
+        result.isSettlingAfterPlugIn = true
+        result.batteryStatus = "充电启动中"
+
+        let transientWarningKinds: Set<String> = [
+            "battery-assist", "not-charging", "low-intake", "no-pd"
+        ]
+        result.diagnostics.removeAll {
+            $0.severity == .warning && transientWarningKinds.contains($0.kind)
+        }
+        result.diagnostics.insert(
+            DiagnosticMessage(
+                kind: "plug-in-settling",
+                text: "电源已接入，充电系统正在稳定，通常需要约 30 秒。",
+                severity: .info
+            ),
+            at: 0
+        )
+        result.status = result.diagnostics.contains { $0.severity == .warning } ? .warn : .ok
+        return result
+    }
+}
+
 // MARK: - 状态中心
 
 @MainActor
@@ -94,10 +154,13 @@ final class PowerStore: ObservableObject {
     }
 
     private var debouncer = WarningDebouncer()
+    private var plugInTransitionFilter = PlugInTransitionFilter()
 
     private func fetchOnce() async {
         do {
-            let info = debouncer.filter(try await PowerMonitor.fetch())
+            let rawInfo = try await PowerMonitor.fetch()
+            let transitionFiltered = plugInTransitionFilter.filter(rawInfo, at: rawInfo.sampledAt)
+            let info = debouncer.filter(transitionFiltered)
             checkTransitions(old: powerInfo, new: info)
             self.powerInfo = info
             self.isLoading = false
@@ -143,10 +206,10 @@ final class PowerStore: ObservableObject {
 
         // 接电但未充电（状态新出现时提醒一次）
         func notChargingWhilePlugged(_ info: PowerInfo) -> Bool {
-            info.adapterLimitWatts != nil && info.isCharging == false && (info.batteryPercent ?? 100) < 100
+            info.diagnostics.contains { $0.kind == "not-charging" }
         }
         if notChargingWhilePlugged(new) && !notChargingWhilePlugged(old) {
-            notify(title: "接电但未充电", body: "检查优化充电 / AlDente，或重新插拔电源线")
+            notify(title: "接电但未充电", body: "稳定期后仍未开始充电；检查优化充电、AlDente 或适配器状态")
         }
     }
 

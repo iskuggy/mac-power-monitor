@@ -104,6 +104,32 @@ final class ParseTests: XCTestCase {
             smcDcIn: nil, smcSystem: 5)
         XCTAssertNil(info.adapterLimitWatts)
     }
+
+    func testNegotiatedPDWithoutBatteryConnectionWarnsPowerPathStuck() {
+        // 真实故障样本：端口控制器已协商 65W，但 AppleSmartBattery 仍报告未接电，PDTR 约为 0。
+        var props = mockProps(
+            onAC: false,
+            percent: 74,
+            isCharging: false,
+            adapterWatts: 65,
+            amperageMa: -627
+        )
+        props["PortControllerInfo"] = [
+            ["PortControllerMaxPower": 0],
+            ["PortControllerMaxPower": 65_000],
+        ]
+
+        let info = PowerMonitor.parse(props, smcDcIn: 0, smcSystem: 8)
+
+        XCTAssertTrue(info.isExternalPowerConnected)
+        XCTAssertEqual(info.adapterLimitWatts, 65)
+        XCTAssertEqual(info.systemPowerInWatts, 0)
+        XCTAssertEqual(info.batteryStatus, "电源路径异常")
+        XCTAssertTrue(info.diagnostics.contains {
+            $0.kind == "power-path-stuck" && $0.severity == .warning
+        })
+        XCTAssertEqual(info.status, .warn)
+    }
 }
 
 final class DebounceTests: XCTestCase {
@@ -128,5 +154,79 @@ final class DebounceTests: XCTestCase {
         let okRaw = PowerMonitor.parse(mockProps(onAC: false), smcDcIn: nil, smcSystem: 5)
         let third = debouncer.filter(okRaw)
         XCTAssertEqual(third.status, .ok)
+    }
+}
+
+final class PlugInTransitionFilterTests: XCTestCase {
+
+    func testSuppressesTransientWarningsDuringGracePeriodAfterObservedPlugIn() {
+        var filter = PlugInTransitionFilter(gracePeriod: 45)
+        let unplugged = PowerMonitor.parse(
+            mockProps(onAC: false, percent: 60),
+            smcDcIn: nil,
+            smcSystem: 9)
+        let plugged = PowerMonitor.parse(
+            mockProps(onAC: true, percent: 60, isCharging: false, adapterWatts: 65),
+            smcDcIn: 0,
+            smcSystem: 9)
+        let unpluggedAt = Date(timeIntervalSince1970: 1_000)
+
+        _ = filter.filter(unplugged, at: unpluggedAt)
+        let result = filter.filter(plugged, at: unpluggedAt.addingTimeInterval(5))
+
+        XCTAssertTrue(result.isSettlingAfterPlugIn)
+        XCTAssertEqual(result.batteryStatus, "充电启动中")
+        XCTAssertFalse(result.diagnostics.contains { $0.severity == .warning })
+        XCTAssertTrue(result.diagnostics.contains { $0.kind == "plug-in-settling" })
+        XCTAssertEqual(result.status, .ok)
+    }
+
+    func testRestoresRealWarningAfterGracePeriodExpires() {
+        var filter = PlugInTransitionFilter(gracePeriod: 45)
+        let unplugged = PowerMonitor.parse(
+            mockProps(onAC: false, percent: 60),
+            smcDcIn: nil,
+            smcSystem: 9)
+        let plugged = PowerMonitor.parse(
+            mockProps(onAC: true, percent: 60, isCharging: false, adapterWatts: 65),
+            smcDcIn: 0,
+            smcSystem: 9)
+        let unpluggedAt = Date(timeIntervalSince1970: 1_000)
+
+        _ = filter.filter(unplugged, at: unpluggedAt)
+        _ = filter.filter(plugged, at: unpluggedAt.addingTimeInterval(5))
+        let result = filter.filter(plugged, at: unpluggedAt.addingTimeInterval(51))
+
+        XCTAssertFalse(result.isSettlingAfterPlugIn)
+        XCTAssertEqual(result.batteryStatus, "已接电，未充电")
+        XCTAssertTrue(result.diagnostics.contains { $0.kind == "not-charging" })
+        XCTAssertEqual(result.status, .warn)
+    }
+
+    func testEndsGracePeriodAsSoonAsChargingActuallyStarts() {
+        var filter = PlugInTransitionFilter(gracePeriod: 45)
+        let unplugged = PowerMonitor.parse(
+            mockProps(onAC: false, percent: 60),
+            smcDcIn: nil,
+            smcSystem: 9)
+        let waiting = PowerMonitor.parse(
+            mockProps(onAC: true, percent: 60, isCharging: false, adapterWatts: 65),
+            smcDcIn: 0,
+            smcSystem: 9)
+        let charging = PowerMonitor.parse(
+            mockProps(onAC: true, percent: 60, isCharging: true, adapterWatts: 65),
+            smcDcIn: 32,
+            smcSystem: 10)
+        let unpluggedAt = Date(timeIntervalSince1970: 1_000)
+
+        _ = filter.filter(unplugged, at: unpluggedAt)
+        _ = filter.filter(waiting, at: unpluggedAt.addingTimeInterval(5))
+        let result = filter.filter(charging, at: unpluggedAt.addingTimeInterval(37))
+
+        XCTAssertFalse(result.isSettlingAfterPlugIn)
+        XCTAssertEqual(result.batteryStatus, "充电中")
+        XCTAssertTrue(result.diagnostics.contains { $0.kind == "charging" })
+        XCTAssertFalse(result.diagnostics.contains { $0.kind == "plug-in-settling" })
+        XCTAssertEqual(result.status, .ok)
     }
 }
