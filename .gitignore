@@ -7,3 +7,4 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 Mac Power Monitor.app/Contents/MacOS/
+Mac Power Monitor.app/Contents/_CodeSignature/

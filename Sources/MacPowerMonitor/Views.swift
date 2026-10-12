@@ -5,7 +5,7 @@ import SwiftUI
 
 @main
 struct MacPowerMonitorApp: App {
-    @StateObject private var store = PowerStore()
+    @State private var store = PowerStore()
 
     var body: some Scene {
         WindowGroup(id: "main") {
@@ -17,6 +17,16 @@ struct MacPowerMonitorApp: App {
         MenuBarExtra {
             TrayMenuView(store: store)
         } label: {
+            MenuBarLabelView(store: store)
+        }
+    }
+}
+
+struct MenuBarLabelView: View {
+    let store: PowerStore
+
+    var body: some View {
+        HStack(spacing: 4) {
             Image(systemName: "bolt.fill")
             Text(store.menuBarLabel)
         }
@@ -24,11 +34,11 @@ struct MacPowerMonitorApp: App {
 }
 
 struct TrayMenuView: View {
-    @ObservedObject var store: PowerStore
+    let store: PowerStore
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if let info = store.powerInfo {
+        if let info = store.menuPowerInfo {
             Text("电源输入 \(String(format: "%.1f", info.systemPowerInWatts))W")
             if let percent = info.batteryPercent {
                 Text("电池 \(percent)%\(batteryStateSuffix(info))")
@@ -58,49 +68,55 @@ struct TrayMenuView: View {
 // MARK: - 主界面
 
 struct ContentView: View {
-    @ObservedObject var store: PowerStore
+    let store: PowerStore
     @AppStorage("appTheme") private var appTheme = "system"
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                HStack {
-                    Text("Mac Power Monitor")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                    Spacer()
-                    ThemeToggleButton(theme: $appTheme)
-                }
-                .padding(.horizontal, 4)
-
-                if store.isLoading {
-                    ProgressView("正在读取电源数据...")
-                        .frame(maxWidth: .infinity, minHeight: 400)
-                } else if let info = store.powerInfo {
-                    if store.errorMessage != nil {
-                        StaleDataBanner(sampledAt: info.sampledAt)
-                    }
-                    HeroSection(info: info, history: store.history)
-                    MetricsGridView(info: info)
-                    BottomPanels(info: info)
-                } else if let error = store.errorMessage {
-                    VStack(spacing: 16) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 48))
-                            .foregroundStyle(.red)
-                        Text("读取失败")
+        GeometryReader { geometry in
+            let contentWidth = max(0, geometry.size.width - 48)
+            ScrollView {
+                VStack(spacing: 20) {
+                    HStack {
+                        Text("Mac Power Monitor")
                             .font(.title2)
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .fontWeight(.bold)
+                        Spacer()
+                        ThemeToggleButton(theme: $appTheme)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 400)
+                    .padding(.horizontal, 4)
+
+                    if store.isLoading {
+                        ProgressView("正在读取电源数据...")
+                            .frame(maxWidth: .infinity, minHeight: 400)
+                    } else if store.hasSample {
+                        if store.errorMessage != nil, let info = store.powerInfo {
+                            StaleDataBanner(sampledAt: info.sampledAt)
+                        }
+                        HeroSection(store: store, isWide: contentWidth >= 820)
+                        MetricsSection(store: store, contentWidth: contentWidth)
+                        BottomPanels(store: store, contentWidth: contentWidth)
+                    } else if let error = store.errorMessage {
+                        VStack(spacing: 16) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 48))
+                                .foregroundStyle(.red)
+                            Text("读取失败")
+                                .font(.title2)
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 400)
+                    }
                 }
+                .frame(width: contentWidth)
+                .padding(24)
             }
-            .padding(24)
         }
         .background(Color(NSColor.windowBackgroundColor))
+        .background(DashboardWindowObserver(store: store).frame(width: 0, height: 0))
         .preferredColorScheme(colorScheme)
+        .frame(minWidth: 560, minHeight: 500)
     }
 
     private var colorScheme: ColorScheme? {
@@ -134,44 +150,46 @@ struct StaleDataBanner: View {
 // MARK: - Hero Section
 
 struct HeroSection: View {
-    let info: PowerInfo
-    let history: [PowerHistoryPoint]
+    let store: PowerStore
+    let isWide: Bool
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 20) {
-                PowerMeterView(info: info)
-                    .frame(width: 340)
-                MiniChartCard(info: info, history: history)
-            }
+        let layout = isWide
+            ? AnyLayout(HStackLayout(spacing: 20))
+            : AnyLayout(VStackLayout(spacing: 20))
+        layout {
+            LivePowerMeter(store: store)
+                .frame(width: isWide ? 340 : nil)
+            MiniChartCard(store: store)
+        }
+    }
+}
 
-            VStack(spacing: 20) {
-                PowerMeterView(info: info)
-                MiniChartCard(info: info, history: history)
-            }
+struct LivePowerMeter: View {
+    let store: PowerStore
+
+    var body: some View {
+        if let info = store.powerInfo {
+            PowerMeterView(info: info)
         }
     }
 }
 
 struct MiniChartCard: View {
-    let info: PowerInfo
-    let history: [PowerHistoryPoint]
+    let store: PowerStore
     @State private var windowSeconds: Double = 1800
 
-    private var visibleHistory: [PowerHistoryPoint] {
-        let cutoff = Date().addingTimeInterval(-windowSeconds)
-        return history.filter { $0.timestamp >= cutoff }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let cutoff = Date().addingTimeInterval(-windowSeconds)
+        let visibleHistory = store.history.filter { $0.timestamp >= cutoff }
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("功率趋势")
                     .font(.caption)
                     .fontWeight(.semibold)
                     .foregroundStyle(.secondary)
                 Spacer()
-                StatusPill(status: info.status)
+                StatusPill(status: store.powerStatus)
             }
 
             HStack(spacing: 12) {
@@ -189,12 +207,14 @@ struct MiniChartCard: View {
 
             if visibleHistory.count > 1 {
                 RealtimeMiniChartView(history: visibleHistory)
-                    .frame(maxWidth: .infinity, minHeight: 180)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 180)
             } else {
                 Text("收集数据中...")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 180)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 180)
             }
         }
         .padding(20)
@@ -566,6 +586,7 @@ struct RealtimeMiniChartView: View {
             }
         }
         .onContinuousHover { phase in
+            guard NSApp.isActive else { return }
             switch phase {
             case .active(let location): hoverX = location.x
             case .ended: hoverX = nil
@@ -577,13 +598,23 @@ struct RealtimeMiniChartView: View {
 
 // MARK: - Metrics Grid
 
-struct MetricsGridView: View {
-    let info: PowerInfo
+struct MetricsSection: View {
+    let store: PowerStore
+    let contentWidth: CGFloat
 
     var body: some View {
-        let columns = [
-            GridItem(.adaptive(minimum: 180, maximum: 250))
-        ]
+        if let metrics = store.metrics {
+            MetricsGridView(info: metrics, columnCount: max(1, min(5, Int((contentWidth + 16) / 196))))
+        }
+    }
+}
+
+struct MetricsGridView: View {
+    let info: DashboardMetrics
+    let columnCount: Int
+
+    var body: some View {
+        let columns = Array(repeating: GridItem(.flexible(minimum: 0), spacing: 16), count: columnCount)
 
         LazyVGrid(columns: columns, spacing: 16) {
             MetricCard(
@@ -681,44 +712,46 @@ struct MetricCard: View {
 // MARK: - Bottom Panels
 
 struct BottomPanels: View {
-    let info: PowerInfo
+    let store: PowerStore
+    let contentWidth: CGFloat
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 16) {
-                PDProfilesPanel(info: info)
-                DiagnosticsPanel(info: info)
-            }
-
-            VStack(spacing: 16) {
-                PDProfilesPanel(info: info)
-                DiagnosticsPanel(info: info)
-            }
+        let isWide = contentWidth >= 820
+        let panelWidth = isWide ? (contentWidth - 16) / 2 : contentWidth
+        let layout = isWide
+            ? AnyLayout(HStackLayout(alignment: .top, spacing: 16))
+            : AnyLayout(VStackLayout(spacing: 16))
+        layout {
+            PDProfilesPanel(store: store, panelWidth: panelWidth)
+                .frame(width: panelWidth)
+            DiagnosticsPanel(store: store)
+                .frame(width: panelWidth)
         }
     }
 }
 
 struct PDProfilesPanel: View {
-    let info: PowerInfo
+    let store: PowerStore
+    let panelWidth: CGFloat
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let profiles = store.profiles
+        let columnCount = max(1, Int((panelWidth - 40 + 10) / 110))
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("PD 档位")
                     .font(.subheadline)
                     .fontWeight(.semibold)
                 Spacer()
-                Text("\(info.profiles.count) 个档位")
+                Text("\(profiles.count) 个档位")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if !info.profiles.isEmpty {
-                LazyVGrid(columns: [
-                    GridItem(.adaptive(minimum: 100))
-                ], spacing: 10) {
-                    ForEach(info.profiles) { profile in
-                        let isActive = profile.index == info.activePDIndex
+            if !profiles.isEmpty {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 0)), count: columnCount), spacing: 10) {
+                    ForEach(profiles) { profile in
+                        let isActive = profile.index == store.activePDIndex
                         VStack(spacing: 4) {
                             Text("\(profile.watts)W")
                                 .font(.title3)
@@ -758,7 +791,7 @@ struct PDProfilesPanel: View {
 }
 
 struct DiagnosticsPanel: View {
-    let info: PowerInfo
+    let store: PowerStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -772,7 +805,7 @@ struct DiagnosticsPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            if info.diagnostics.isEmpty {
+            if store.diagnostics.isEmpty {
                 HStack(alignment: .top, spacing: 10) {
                     Circle()
                         .fill(Color.green)
@@ -791,7 +824,7 @@ struct DiagnosticsPanel: View {
                         .stroke(Color.green.opacity(0.2), lineWidth: 1)
                 )
             } else {
-                ForEach(info.diagnostics, id: \.self) { diagnostic in
+                ForEach(store.diagnostics, id: \.kind) { diagnostic in
                     HStack(alignment: .top, spacing: 10) {
                         Circle()
                             .fill(diagnostic.color)

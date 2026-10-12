@@ -1,6 +1,6 @@
 import Foundation
 import IOKit.ps
-import SwiftUI
+import Observation
 import UserNotifications
 
 // MARK: - 警告去抖
@@ -83,28 +83,59 @@ struct PlugInTransitionFilter {
 // MARK: - 状态中心
 
 @MainActor
-final class PowerStore: ObservableObject {
-    @Published var powerInfo: PowerInfo?
-    @Published var isLoading = true
-    @Published var history: [PowerHistoryPoint] = []
-    @Published var errorMessage: String?
+@Observable
+final class PowerStore {
+    // 仅前台主窗口使用这些属性；各子视图只观察自己需要的字段。
+    private(set) var powerInfo: PowerInfo?
+    private(set) var isLoading = true
+    private(set) var hasSample = false
+    private(set) var history: [PowerHistoryPoint] = []
+    private(set) var errorMessage: String?
+    private(set) var metrics: DashboardMetrics?
+    private(set) var profiles: [PowerProfile] = []
+    private(set) var activePDIndex: Int?
+    private(set) var diagnostics: [DiagnosticMessage] = []
+    private(set) var powerStatus: PowerStatus = .ok
+
+    // 菜单栏继续实时更新，不依赖主窗口的发布状态。
+    private(set) var menuPowerInfo: PowerInfo?
+    private(set) var menuBarLabel = "--"
+
+    @ObservationIgnored private var latestPowerInfo: PowerInfo?
+    @ObservationIgnored private var latestErrorMessage: String?
+    @ObservationIgnored private var historyBuffer: [PowerHistoryPoint] = []
 
     // nonisolated(unsafe)：只在 MainActor 上写入，deinit 时独占访问，仅为让 deinit 能清理
-    nonisolated(unsafe) private var timer: Timer?
-    private var started = false
+    @ObservationIgnored nonisolated(unsafe) private var timer: Timer?
+    @ObservationIgnored private var started = false
     // 订阅系统电源事件用的 run loop source（插拔/电量变化，事件到达立即刷新）
     // nonisolated(unsafe)：只在 MainActor 上写入，deinit 时独占访问
-    nonisolated(unsafe) private var powerSourceRunLoopSource: CFRunLoopSource?
+    @ObservationIgnored nonisolated(unsafe) private var powerSourceRunLoopSource: CFRunLoopSource?
     private let updateInterval: TimeInterval = 2.0
     private let maxHistoryDuration: TimeInterval = 7200 // 保留 2 小时
 
-    init() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        start()
+    init(startAutomatically: Bool = true) {
+        if startAutomatically {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            start()
+        }
     }
 
-    var menuBarLabel: String {
-        guard let info = powerInfo else { return "--" }
+    @ObservationIgnored private var activeDashboardClients: Set<UUID> = []
+
+    func setDashboardActive(_ active: Bool, for client: UUID) {
+        let wasActive = !activeDashboardClients.isEmpty
+        if active {
+            activeDashboardClients.insert(client)
+        } else {
+            activeDashboardClients.remove(client)
+        }
+        if !wasActive, !activeDashboardClients.isEmpty {
+            publishDashboard()
+        }
+    }
+
+    private func menuLabel(for info: PowerInfo) -> String {
         if info.systemPowerInWatts > 0.5 {
             return String(format: "%.0fW", info.systemPowerInWatts)
         }
@@ -115,7 +146,7 @@ final class PowerStore: ObservableObject {
     }
 
     deinit {
-        // PowerStore 实际是进程生命周期单例（App 级 @StateObject），此处纯属工程卫生
+        // PowerStore 是进程生命周期单例（App 级 @State），此处清理系统订阅。
         timer?.invalidate()
         if let source = powerSourceRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
@@ -134,6 +165,7 @@ final class PowerStore: ObservableObject {
                         await self?.fetchOnce()
                     }
                 }
+                self.timer?.tolerance = 0.2
             }
         }
     }
@@ -153,34 +185,62 @@ final class PowerStore: ObservableObject {
         }
     }
 
-    private var debouncer = WarningDebouncer()
-    private var plugInTransitionFilter = PlugInTransitionFilter()
+    @ObservationIgnored private var debouncer = WarningDebouncer()
+    @ObservationIgnored private var plugInTransitionFilter = PlugInTransitionFilter()
 
     private func fetchOnce() async {
         do {
-            let rawInfo = try await PowerMonitor.fetch()
-            let transitionFiltered = plugInTransitionFilter.filter(rawInfo, at: rawInfo.sampledAt)
-            let info = debouncer.filter(transitionFiltered)
-            checkTransitions(old: powerInfo, new: info)
-            self.powerInfo = info
-            self.isLoading = false
-            self.errorMessage = nil
-
-            let point = PowerHistoryPoint(
-                timestamp: Date(),
-                watts: info.systemPowerInWatts,
-                batteryWatts: info.batteryRealWatts ?? 0
-            )
-            self.history.append(point)
-            let cutoff = Date().addingTimeInterval(-maxHistoryDuration)
-            if let firstValid = self.history.firstIndex(where: { $0.timestamp >= cutoff }), firstValid > 0 {
-                self.history.removeFirst(firstValid)
-            }
-
+            receiveSample(try await PowerMonitor.fetch())
         } catch {
-            self.errorMessage = error.localizedDescription
-            self.isLoading = false
+            receiveFailure(error.localizedDescription)
         }
+    }
+
+    func receiveSample(_ rawInfo: PowerInfo) {
+        let transitionFiltered = plugInTransitionFilter.filter(rawInfo, at: rawInfo.sampledAt)
+        let info = debouncer.filter(transitionFiltered)
+        checkTransitions(old: latestPowerInfo, new: info)
+        latestPowerInfo = info
+        latestErrorMessage = nil
+        menuPowerInfo = info
+        let label = menuLabel(for: info)
+        if menuBarLabel != label { menuBarLabel = label }
+
+        historyBuffer.append(PowerHistoryPoint(
+            timestamp: info.sampledAt,
+            watts: info.systemPowerInWatts,
+            batteryWatts: info.batteryRealWatts ?? 0
+        ))
+        let cutoff = info.sampledAt.addingTimeInterval(-maxHistoryDuration)
+        if let firstValid = historyBuffer.firstIndex(where: { $0.timestamp >= cutoff }), firstValid > 0 {
+            historyBuffer.removeFirst(firstValid)
+        }
+        if !activeDashboardClients.isEmpty { publishDashboard() }
+    }
+
+    func receiveFailure(_ message: String) {
+        latestErrorMessage = message
+        if !activeDashboardClients.isEmpty {
+            if errorMessage != message { errorMessage = message }
+            if isLoading { isLoading = false }
+        }
+    }
+
+    private func publishDashboard() {
+        if let info = latestPowerInfo {
+            powerInfo = info
+            history = historyBuffer
+            let nextMetrics = DashboardMetrics(info)
+            if metrics != nextMetrics { metrics = nextMetrics }
+            if profiles != info.profiles { profiles = info.profiles }
+            if activePDIndex != info.activePDIndex { activePDIndex = info.activePDIndex }
+            if diagnostics != info.diagnostics { diagnostics = info.diagnostics }
+            if powerStatus != info.status { powerStatus = info.status }
+            if !hasSample { hasSample = true }
+        }
+        if errorMessage != latestErrorMessage { errorMessage = latestErrorMessage }
+        let loading = latestPowerInfo == nil && latestErrorMessage == nil
+        if isLoading != loading { isLoading = loading }
     }
 
     // MARK: 状态跃迁通知

@@ -1,6 +1,6 @@
 # Mac Power Monitor
 
-macOS 电源充电监测工具（SwiftUI 原生，Apple Silicon）。直接读取 IOKit 注册表（AppleSmartBattery），零子进程、零轮询开销。
+macOS 电源充电监测工具（SwiftUI 原生，Apple Silicon）。直接读取 IOKit 注册表（AppleSmartBattery），实时采样不启动外部命令。
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 6](https://img.shields.io/badge/Swift-6-orange)
 
@@ -19,10 +19,21 @@ macOS 电源充电监测工具（SwiftUI 原生，Apple Silicon）。直接读�
 ```bash
 swift build -c release
 cp .build/release/MacPowerMonitor "Mac Power Monitor.app/Contents/MacOS/MacPowerMonitor"
+codesign --force --deep --sign - "Mac Power Monitor.app"
 open "Mac Power Monitor.app"
 ```
 
 app 包骨架（Info.plist、图标）在仓库内，构建后把二进制复制进去即可运行。
+
+也可用 `./script/build_and_run.sh --verify` 构建并重启已有的 app；默认 Debug，
+日常使用的 Release 版本运行 `MAC_POWER_BUILD_CONFIGURATION=release ./script/build_and_run.sh --verify`。
+
+## 刷新与后台行为
+
+- 周期采样间隔保持两秒，插拔事件仍立即采样；历史记录和通知在后台持续工作。菜单栏显示整数功率，显示值变化才更新标签。
+- 主窗口只在应用处于前台且窗口可见时刷新；切换应用、隐藏、最小化或关闭窗口后暂停主界面发布。
+- 回到前台立即同步最近的采样和后台积累的历史。实时功率、指标、PD 档位和诊断分别观察各自的数据。
+- 横向/纵向布局由窗口宽度直接选择，避免对同一内容反复试算多套布局。
 
 ## 数据来源
 

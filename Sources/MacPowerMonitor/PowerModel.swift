@@ -8,7 +8,7 @@ enum PowerStatus {
 }
 
 struct PowerProfile: Identifiable, Hashable {
-    let id = UUID()
+    var id: Int { index }
     let index: Int
     let voltageV: Double
     let currentA: Double
